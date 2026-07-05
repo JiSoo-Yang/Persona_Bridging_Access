@@ -33,11 +33,10 @@ from transformers import (
     LogitsProcessorList, NoBadWordsLogitsProcessor,
 )
 
-from langchain_openai import ChatOpenAI
-from langchain.agents import create_agent
-from langchain_core.tools import tool
-from langgraph.checkpoint.memory import MemorySaver
-from langchain_core.messages import HumanMessage, SystemMessage
+# NOTE: LangChain / LangGraph are imported lazily inside create_tool_agent()
+# and run_interview_system() so that the pure helper functions in this module
+# (persona generation, bridging/graph utilities, embedding similarity) can be
+# reused by the local, API-key-free demo pipeline without requiring LangChain.
 
 # ============================================================================
 # 유틸리티
@@ -165,7 +164,6 @@ def generate_random_persona(dummy: str = "") -> Dict:
         }
         return fallback
 
-@tool
 def create_bridging_extraction_prompt_tool(conversation_json: str) -> str:
     """
     브리징 관계 추출을 위한 상세 프롬프트를 생성합니다.
@@ -232,7 +230,6 @@ If no bridging relations found, return: {{"bridging_relations": []}}
     except Exception as e:
         return f"Error creating prompt: {str(e)}"
 
-@tool
 def save_bridging_results_tool(bridging_json: str, filename: str = "bridging_results.json") -> str:
     """추출된 브리징 관계를 JSON 파일로 저장합니다."""
     try:
@@ -243,7 +240,6 @@ def save_bridging_results_tool(bridging_json: str, filename: str = "bridging_res
     except Exception as e:
         return f"Error saving bridging results: {str(e)}"
 
-@tool
 def create_and_save_graph_tool(bridging_json: str, output_prefix: str = "graph") -> str:
     """
     브리징 관계를 기반으로 중요도 그래프를 생성하고 JSON과 PNG로 저장합니다.
@@ -701,11 +697,21 @@ class HuggingFaceModelWrapper:
         chat = [_to_dict(m) for m in messages]
 
         # Qwen 전용 chat template
-        text = self.tokenizer.apply_chat_template(
-            chat,
-            tokenize=False,
-            add_generation_prompt=True
-        )
+        # Qwen3는 기본적으로 <think> 추론 블록을 생성하므로 enable_thinking=False로 차단.
+        # (Qwen2.5 등 미지원 모델은 TypeError → 인자 없이 재시도)
+        try:
+            text = self.tokenizer.apply_chat_template(
+                chat,
+                tokenize=False,
+                add_generation_prompt=True,
+                enable_thinking=False,
+            )
+        except TypeError:
+            text = self.tokenizer.apply_chat_template(
+                chat,
+                tokenize=False,
+                add_generation_prompt=True,
+            )
         inputs = self.tokenizer([text], return_tensors="pt").to("cpu")
 
         def _generate_once(use_filters: bool):
@@ -793,14 +799,19 @@ STRICT OUTPUT RULES:
 # 에이전트 생성
 # ============================================================================
 
-def create_tool_agent(openai_api_key: str, memory: MemorySaver, prediction_template: Dict):
+def create_tool_agent(openai_api_key: str, memory, prediction_template: Dict):
     """Tool Agent (GPT) 생성 - 예측해야 할 속성 카테고리만 전달 (값 없음)"""
+    from langchain_openai import ChatOpenAI
+    from langchain.agents import create_agent
+    from langchain_core.tools import tool
+
     llm = ChatOpenAI(model=TOOL_MODEL, api_key=openai_api_key, temperature=0.3)
 
+    # Wrap the plain helper functions as LangChain tools for the GPT agent path.
     tools = [
-        create_bridging_extraction_prompt_tool,
-        save_bridging_results_tool,
-        create_and_save_graph_tool,
+        tool(create_bridging_extraction_prompt_tool),
+        tool(save_bridging_results_tool),
+        tool(create_and_save_graph_tool),
     ]
 
     prediction_targets = f"""
@@ -881,6 +892,9 @@ def run_interview_system(
     num_questions: int = 5,
     device: str = "cpu",
 ):
+    from langgraph.checkpoint.memory import MemorySaver
+    from langchain_core.messages import HumanMessage, SystemMessage
+
     print(f"\n{'='*80}")
     print("Persona Interview System with Qwen Embedding Similarity")
     print(f"Tool Agent: OpenAI {TOOL_MODEL}")
